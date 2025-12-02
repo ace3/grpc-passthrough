@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  grpc-passthrough:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # Override if you want a different port inside the container
+      - PORT=3000

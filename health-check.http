@@ -1,0 +1,15 @@
+@baseUrl = http://localhost:3000
+
+### gRPC health check passthrough
+POST {{baseUrl}}/health/check
+Content-Type: application/json
+
+{
+  "target": "payment.dev.v2.nobi.id:443",
+  "service": "",
+  "insecure": false,
+  "metadata": [
+    { "key": "X-Client-ID", "value": "" },
+    { "key": "client-key", "value": "" }
+  ]
+}
