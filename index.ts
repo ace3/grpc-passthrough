@@ -234,8 +234,16 @@ const server = Bun.serve({
             ? (serviceError.metadata as Metadata).getMap()
             : undefined;
 
-        // gRPC code 16 = UNAUTHENTICATED -> HTTP 401
-        const httpStatus = serviceError?.code === 16 ? 401 : 502;
+        // Determine HTTP status based on gRPC error code
+        // Code 16 = UNAUTHENTICATED
+        // Code 7 = PERMISSION_DENIED
+        // Code 13 with parsing error = likely auth rejection returning non-gRPC response
+        const isAuthError =
+          serviceError?.code === 16 ||
+          serviceError?.code === 7 ||
+          (serviceError?.code === 13 &&
+            serviceError?.details?.includes("Response message parsing error"));
+        const httpStatus = isAuthError ? 401 : 502;
 
         return jsonResponse(httpStatus, {
           error: serviceError?.message ?? "Health check failed.",
