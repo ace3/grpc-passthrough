@@ -234,7 +234,10 @@ const server = Bun.serve({
             ? (serviceError.metadata as Metadata).getMap()
             : undefined;
 
-        return jsonResponse(502, {
+        // gRPC code 16 = UNAUTHENTICATED -> HTTP 401
+        const httpStatus = serviceError?.code === 16 ? 401 : 502;
+
+        return jsonResponse(httpStatus, {
           error: serviceError?.message ?? "Health check failed.",
           code: serviceError?.code,
           details: serviceError?.details,
