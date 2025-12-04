@@ -1,13 +1,13 @@
 import {
   ChannelCredentials,
+  Client,
   Metadata,
-  ServiceError,
   credentials,
-  loadPackageDefinition,
+  makeGenericClientConstructor,
 } from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
+
+import type { ServiceError } from "@grpc/grpc-js";
 import { createHmac } from "node:crypto";
-import { fileURLToPath } from "node:url";
 
 type MetadataItem = { key: string; value: string | number | boolean };
 
@@ -34,34 +34,125 @@ type HealthCheckResult = {
   response: unknown;
 };
 
-type HealthClientConstructor = new (
-  address: string,
-  creds: ChannelCredentials
-) => {
+// Define the Health service using generic client constructor
+// This approach is more lenient with response parsing
+const HealthServiceDefinition = {
+  Check: {
+    path: "/grpc.health.v1.Health/Check",
+    requestStream: false,
+    responseStream: false,
+    requestSerialize: (request: { service?: string }) => {
+      // Manually serialize the request (simple proto encoding)
+      const service = request.service ?? "";
+      if (service.length === 0) {
+        return Buffer.alloc(0);
+      }
+      // Field 1, wire type 2 (length-delimited) = 0x0a
+      const serviceBytes = Buffer.from(service, "utf8");
+      const header = Buffer.from([0x0a, serviceBytes.length]);
+      return Buffer.concat([header, serviceBytes]);
+    },
+    requestDeserialize: (buffer: Buffer) => {
+      return { service: buffer.toString("utf8") };
+    },
+    responseSerialize: (response: unknown) => {
+      return Buffer.from(JSON.stringify(response));
+    },
+    responseDeserialize: (buffer: Buffer): Record<string, unknown> => {
+      // Parse protobuf response manually to handle non-standard responses
+      return parseProtobufResponse(buffer);
+    },
+  },
+};
+
+/**
+ * Manually parse a protobuf response buffer.
+ * This is lenient and handles unknown fields gracefully.
+ */
+function parseProtobufResponse(buffer: Buffer): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    const tag = buffer[offset];
+    if (tag === undefined) break;
+
+    const fieldNumber = tag >> 3;
+    const wireType = tag & 0x07;
+    offset++;
+
+    switch (wireType) {
+      case 0: {
+        // Varint
+        let value = 0;
+        let shift = 0;
+        while (offset < buffer.length) {
+          const byte = buffer[offset];
+          if (byte === undefined) break;
+          offset++;
+          value |= (byte & 0x7f) << shift;
+          if ((byte & 0x80) === 0) break;
+          shift += 7;
+        }
+        result[`field_${fieldNumber}`] = value;
+        // Map known fields
+        if (fieldNumber === 1) {
+          result.status = value;
+        }
+        break;
+      }
+      case 2: {
+        // Length-delimited (string, bytes, embedded message)
+        let length = 0;
+        let shift = 0;
+        while (offset < buffer.length) {
+          const byte = buffer[offset];
+          if (byte === undefined) break;
+          offset++;
+          length |= (byte & 0x7f) << shift;
+          if ((byte & 0x80) === 0) break;
+          shift += 7;
+        }
+        const data = buffer.subarray(offset, offset + length);
+        offset += length;
+
+        // Try to decode as UTF-8 string
+        try {
+          const str = data.toString("utf8");
+          result[`field_${fieldNumber}`] = str;
+          // Map known fields based on observed server responses
+          if (fieldNumber === 2) result.latency = str;
+          if (fieldNumber === 4) result.error_code = str;
+          if (fieldNumber === 5) result.error_message = str;
+        } catch {
+          result[`field_${fieldNumber}`] = data;
+        }
+        break;
+      }
+      default:
+        // Skip unknown wire types
+        console.warn(`Unknown wire type ${wireType} at offset ${offset - 1}`);
+        // Try to skip - this is a best effort
+        offset = buffer.length; // Exit loop for safety
+        break;
+    }
+  }
+
+  return result;
+}
+
+type HealthClient = Client & {
   Check(
     request: { service?: string },
-    md: Metadata,
-    callback: (err: ServiceError | null, response: { status?: string | number }) => void
+    metadata: Metadata,
+    callback: (err: ServiceError | null, response: Record<string, unknown>) => void
   ): void;
-  close(): void;
 };
 
-type HealthProto = {
-  grpc: { health: { v1: { Health: HealthClientConstructor } } };
-};
-
-const HEALTH_PROTO_PATH = fileURLToPath(new URL("./health.proto", import.meta.url));
-
-const packageDefinition = protoLoader.loadSync(HEALTH_PROTO_PATH, {
-  keepCase: true,
-  longs: String,
-  enums: String,
-  defaults: true,
-  oneofs: true,
-});
-
-const healthPackage = loadPackageDefinition(packageDefinition) as unknown as HealthProto;
-const HealthClient = healthPackage.grpc.health.v1.Health;
+const GenericHealthClient = makeGenericClientConstructor(
+  HealthServiceDefinition,
+  "grpc.health.v1.Health"
+) as unknown as new (address: string, creds: ChannelCredentials) => HealthClient;
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -136,13 +227,13 @@ async function performHealthCheck(
   }
 
   const channelCredentials = input.insecure ? credentials.createInsecure() : credentials.createSsl();
-  const client = new HealthClient(target, channelCredentials);
+  const client = new GenericHealthClient(target, channelCredentials);
 
   return new Promise<HealthCheckResult>((resolve, reject) => {
     client.Check(
       { service: input.service ?? "" },
       grpcMetadata,
-      (err: ServiceError | null, response: { status?: string | number }) => {
+      (err: ServiceError | null, response: Record<string, unknown>) => {
         client.close();
 
         if (err) {
@@ -150,7 +241,7 @@ async function performHealthCheck(
           return;
         }
 
-        const rawStatus = response?.status;
+        const rawStatus = response?.status as string | number | undefined;
         const status = statusToString(rawStatus);
 
         resolve({
@@ -200,11 +291,11 @@ const server = Bun.serve({
     }
 
     if (pathname === "/health/check" && req.method === "POST") {
-      let payload: HealthCheckInput | null = null;
+      let payload: HealthCheckInput;
       let metadataSent: MetadataItem[] | undefined;
 
       try {
-        payload = await req.json();
+        payload = await req.json() as HealthCheckInput;
       } catch (error) {
         return jsonResponse(400, {
           error: "Invalid JSON payload.",

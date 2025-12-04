@@ -13,7 +13,11 @@ message HealthCheckResponse {
     NOT_SERVING = 2;
     SERVICE_UNKNOWN = 3;
   }
-  ServingStatus status = 1;
+  // Note: Your server interceptor returns int32, not enum
+  int32 status = 1;
+  string latency = 2;
+  string error_code = 4;
+  string error_message = 5;
 }
 
 service Health {
